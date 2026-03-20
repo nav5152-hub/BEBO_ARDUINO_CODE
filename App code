@@ -1,0 +1,1087 @@
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import {
+  View,
+  Text,
+  TextInput,
+  Pressable,
+  ScrollView,
+  StyleSheet,
+  Alert,
+  Dimensions,
+  Animated,
+  Modal,
+} from 'react-native';
+import { Car } from 'lucide-react-native';
+import Svg, { Rect, Circle } from 'react-native-svg';
+import { useFonts, Sora_400Regular, Sora_600SemiBold, Sora_700Bold } from '@expo-google-fonts/sora';
+ 
+// Get screen height for responsive layout
+const { height: screenHeight } = Dimensions.get('window');
+ 
+// Size of the car icon on the map (pixels)
+const CAR_SIZE = 26;
+ 
+// Default Arduino IP address (hotspot connection)
+const DEFAULT_ARDUINO_IP = '172.20.10.5';
+ 
+// Number of digits in the binary PIN code
+const PIN_LENGTH = 4;
+ 
+// Maximum number of incorrect PIN attempts before trip is cancelled
+const MAX_PIN_ATTEMPTS = 3;
+ 
+// ============================================================
+// CUSTOM CAR ICON COMPONENT
+// Renders a simple top-down car shape using SVG
+// ============================================================
+const CarIcon = ({ size = 26, color = '#111827' }) => (
+  <Svg width={size} height={size} viewBox="0 0 64 32">
+    <Rect x="8" y="12" width="40" height="12" rx="4" fill={color} />   {/* Car body */}
+    <Rect x="22" y="6" width="20" height="10" rx="3" fill={color} />   {/* Car roof */}
+    <Circle cx="18" cy="26" r="4" fill="#111" />                        {/* Left wheel */}
+    <Circle cx="42" cy="26" r="4" fill="#111" />                        {/* Right wheel */}
+  </Svg>
+);
+ 
+// ============================================================
+// UTILITY FUNCTIONS
+// ============================================================
+ 
+// Generates a random binary PIN string of the given length
+// e.g. randomBinaryPin(4) might return "1010" or "0110"
+const randomBinaryPin = (len = 4) => {
+  let s = '';
+  for (let i = 0; i < len; i++) s += Math.random() < 0.5 ? '0' : '1';
+  return s;
+};
+ 
+// Returns a promise that resolves after the given number of milliseconds
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+ 
+// ============================================================
+// MAIN APP COMPONENT
+// ============================================================
+export default function BeboDeliveryApp() {
+ 
+  // Load custom Sora fonts
+  const [fontsLoaded] = useFonts({
+    Sora_400Regular,
+    Sora_600SemiBold,
+    Sora_700Bold,
+  });
+ 
+  // ---------- Connection Settings ----------
+  const [arduinoIp, setArduinoIp] = useState(DEFAULT_ARDUINO_IP); // Arduino IP address
+  // Constructs the base URL dynamically when IP changes
+  const ARDUINO_BASE_URL = useMemo(() => `http://${arduinoIp.trim()}`, [arduinoIp]);
+ 
+  // ---------- UI Settings ----------
+  const [isDarkMode, setIsDarkMode] = useState(false);  // Dark/light theme toggle
+  const [proxyMode, setProxyMode] = useState(false);    // Proxy mode simulates delivery without Arduino
+ 
+  // ---------- User Login ----------
+  const [userName, setUserName] = useState('');         // User's entered name
+  const [nameSubmitted, setNameSubmitted] = useState(false); // Whether login screen has been passed
+ 
+  // ---------- Navigation & Flow State ----------
+  // Controls which screen/panel is currently displayed
+  // Possible values: 'home', 'tripToPickup', 'pickupPin', 'destinationInput',
+  //                  'tripToDestination', 'destinationPin', 'returnParking', 'returningParking'
+  const [currentView, setCurrentView] = useState('home');
+ 
+  // ---------- Arduino Connection ----------
+  const [arduinoConnected, setArduinoConnected] = useState(false); // True if Arduino is reachable
+ 
+  // ---------- Delivery Point Inputs ----------
+  const [pickupInput, setPickupInput] = useState('');           // Raw text input for pickup
+  const [destinationInput, setDestinationInput] = useState(''); // Raw text input for destination
+  const [pickupKey, setPickupKey] = useState(null);             // Confirmed pickup point (1-4)
+  const [destinationKey, setDestinationKey] = useState(null);   // Confirmed destination point (1-4)
+ 
+  // ---------- PIN State ----------
+  const [pickupPinCode, setPickupPinCode] = useState('');   // Generated PIN for pickup (load)
+  const [destPinCode, setDestPinCode] = useState('');       // Generated PIN for destination (unload)
+  const [enteredKeys, setEnteredKeys] = useState('');       // Keys pressed on the physical switches (from Arduino)
+  const [pinStatus, setPinStatus] = useState('IDLE');       // Current lock/door status from Arduino
+  const [attemptsLeft, setAttemptsLeft] = useState(MAX_PIN_ATTEMPTS); // Remaining PIN attempts
+ 
+  // ---------- Timeline & Rating ----------
+  const [timeline, setTimeline] = useState([]);             // Log of timestamped delivery events
+  const [rating, setRating] = useState(null);               // User's selected rating (1-5)
+  const [ratingModalVisible, setRatingModalVisible] = useState(false); // Controls rating modal visibility
+ 
+  // ---------- Refs (persistent values that don't trigger re-render) ----------
+  const pinPollRef = useRef(null);            // Stores the setInterval ID for PIN polling
+  const lastPinStatusRef = useRef('');        // Tracks last processed PIN status to avoid duplicate actions
+  const failAttemptsRef = useRef(0);          // Counts failed PIN attempts
+  const phaseRef = useRef('LOAD');            // 'LOAD' = sender placing parcel, 'UNLOAD' = recipient collecting
+ 
+  // ---------- Map & Animation ----------
+  const [mapSize, setMapSize] = useState({ width: 0, height: 0 }); // Actual pixel dimensions of map view
+  const tripAnim = useRef(new Animated.Value(0)).current;           // Animation progress value (0 to 1)
+ 
+  const [currentCarPoint, setCurrentCarPoint] = useState('parking'); // Current robot position on map
+  const carPointRef = useRef('parking');                              // Ref version for use in async functions
+  const [travelRoute, setTravelRoute] = useState(null);              // Active route { from, to } during animation
+ 
+  // ============================================================
+  // THEME OBJECT
+  // Provides colour values for all UI elements based on dark/light mode
+  // ============================================================
+  const theme = isDarkMode
+    ? {
+        appBg: '#0b1220',
+        panelBg: 'rgba(17,24,39,0.96)',
+        cardBg: '#1f2937',
+        inputBg: '#111827',
+        border: '#334155',
+        text: '#f9fafb',
+        subText: '#cbd5e1',
+        mapBg: '#0f172a',
+        headerBg: '#111827',
+      }
+    : {
+        appBg: '#f3f4f6',
+        panelBg: 'rgba(255,255,255,0.92)',
+        cardBg: '#f8fafc',
+        inputBg: '#ffffff',
+        border: '#e5e7eb',
+        text: '#111827',
+        subText: '#475569',
+        mapBg: '#e8edf3',
+        headerBg: '#ffffff',
+      };
+ 
+  // ============================================================
+  // MAP CONFIGURATION
+  // Defines proportional (0-1) positions of each delivery point on the map
+  // These are multiplied by the actual map pixel dimensions at render time
+  // ============================================================
+  const pointMap = {
+    '1': { x: 0.18, y: 0.22 },   // Top-left
+    '2': { x: 0.82, y: 0.22 },   // Top-right
+    '3': { x: 0.18, y: 0.78 },   // Bottom-left
+    '4': { x: 0.82, y: 0.78 },   // Bottom-right
+    parking: { x: 0.5, y: 0.5 }, // Centre (home position)
+  };
+ 
+  // Labels for each step of the delivery progress bar
+  const progressSteps = ['Ready', 'To Pickup', 'Loading', 'To Destination', 'Unloading', 'Returning', 'Complete'];
+ 
+  // Converts a point key to pixel coordinates based on current map size
+  const toPx = (key) => {
+    const p = pointMap[key];
+    if (!p || mapSize.width === 0) return { x: 0, y: 0 };
+    return { x: p.x * mapSize.width, y: p.y * mapSize.height };
+  };
+ 
+  // Returns true if the input is a valid delivery point (1, 2, 3, or 4)
+  const isValidPoint = (v) => ['1', '2', '3', '4'].includes(String(v).trim());
+ 
+  // Strips any invalid characters from point input (only digits 1-4 allowed)
+  const sanitizePointInput = (v) => String(v).replace(/[^1-4]/g, '').slice(0, 1);
+ 
+  // ============================================================
+  // PROGRESS BAR
+  // Maps current view to a step index for the progress bar display
+  // ============================================================
+  const getProgressIndex = () => {
+    if (ratingModalVisible) return 6;       // Final step shown during rating
+    switch (currentView) {
+      case 'home': return 0;
+      case 'tripToPickup': return 1;
+      case 'pickupPin': return 2;
+      case 'destinationInput':
+      case 'tripToDestination': return 3;
+      case 'destinationPin': return 4;
+      case 'returnParking':
+      case 'returningParking': return 5;
+      default: return 0;
+    }
+  };
+ 
+  const progressIndex = getProgressIndex();
+  const isTripActive = currentView !== 'home'; // True whenever a delivery is in progress
+ 
+  // ============================================================
+  // TIMELINE LOGGER
+  // Adds a timestamped message to the timeline log displayed in the app
+  // ============================================================
+  const addStatus = (msg) => {
+    const now = new Date();
+    const t = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    setTimeline((prev) => [...prev, `${t} • ${msg}`]);
+  };
+ 
+  // Updates both the ref and state for the current car position
+  const setCarPoint = (pt) => {
+    const next = String(pt);
+    carPointRef.current = next;
+    setCurrentCarPoint(next);
+  };
+ 
+  // ============================================================
+  // CAR ANIMATION
+  // Smoothly animates the car icon from one map point to another
+  // Uses React Native's Animated.timing with translateX/translateY
+  // ============================================================
+  const animateCarTo = async (toPoint, duration = 3000) => {
+    const to = String(toPoint);
+    const from = carPointRef.current;
+    if (from === to) return; // No movement needed
+ 
+    setTravelRoute({ from, to });   // Set active route for interpolation
+    tripAnim.stopAnimation();
+    tripAnim.setValue(0);           // Reset animation to start
+ 
+    // Run animation and wait for completion
+    await new Promise((resolve) => {
+      Animated.timing(tripAnim, { toValue: 1, duration, useNativeDriver: true }).start(() => resolve());
+    });
+ 
+    tripAnim.setValue(1);
+    setTravelRoute(null);    // Clear route after animation completes
+    setCarPoint(to);         // Update car position to destination
+  };
+ 
+  // ============================================================
+  // HTTP UTILITIES
+  // ============================================================
+ 
+  // Sends a fetch request with an automatic timeout (aborts after ms milliseconds)
+  const fetchWithTimeout = async (url, ms = 3000) => {
+    const controller = new AbortController();
+    const t = setTimeout(() => controller.abort(), ms);
+    try {
+      return await fetch(url, { signal: controller.signal });
+    } finally {
+      clearTimeout(t);
+    }
+  };
+ 
+  // Fetches the full robot state JSON from /state endpoint
+  const getCarState = async () => {
+    const res = await fetchWithTimeout(`${ARDUINO_BASE_URL}/state`, 1500);
+    if (!res.ok) throw new Error('state failed');
+    return await res.json();
+  };
+ 
+  // Polls /state repeatedly until the robot is idle at the expected point
+  // Throws an error if the timeout is exceeded
+  const waitUntilIdleAt = async (point, timeoutMs = 60000) => {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      const st = await getCarState();
+      const current = String(st.currentPoint ?? st.current ?? '');
+      if (!st.moving && current === String(point)) return true; // Robot has arrived
+      await sleep(350); // Poll every 350ms
+    }
+    throw new Error(`timeout at point ${point}`);
+  };
+ 
+  // Sends /go?to=N with retry logic to handle 409 (busy) responses
+  const goToPointReliable = async (point, retries = 25) => {
+    for (let i = 0; i < retries; i++) {
+      const res = await fetchWithTimeout(`${ARDUINO_BASE_URL}/go?to=${encodeURIComponent(point)}`, 2500);
+      if (res.ok) return true;
+      if (res.status === 409) { await sleep(400); continue; } // Robot busy, retry
+      const txt = await res.text().catch(() => '');
+      throw new Error(`go failed ${res.status} ${txt}`);
+    }
+    throw new Error('go busy');
+  };
+ 
+  // Sends /go-parking with retry logic
+  const goParkingReliable = async (retries = 25) => {
+    for (let i = 0; i < retries; i++) {
+      const res = await fetchWithTimeout(`${ARDUINO_BASE_URL}/go-parking`, 2500);
+      if (res.ok) return true;
+      if (res.status === 409) { await sleep(400); continue; }
+      const txt = await res.text().catch(() => '');
+      throw new Error(`go-parking failed ${res.status} ${txt}`);
+    }
+    throw new Error('go-parking busy');
+  };
+ 
+  // ============================================================
+  // PIN POLLING
+  // Polls /pin-feed and /pin-status from Arduino every 350ms
+  // Updates UI and triggers next flow step based on status changes
+  // ============================================================
+ 
+  // Clears the active polling interval
+  const clearPinPolling = () => {
+    if (pinPollRef.current) {
+      clearInterval(pinPollRef.current);
+      pinPollRef.current = null;
+    }
+  };
+ 
+  // Resets all delivery flow state back to the initial home state
+  const resetFlow = () => {
+    clearPinPolling();
+    setCurrentView('home');
+    setPickupInput('');
+    setDestinationInput('');
+    setPickupKey(null);
+    setDestinationKey(null);
+    setPickupPinCode('');
+    setDestPinCode('');
+    setEnteredKeys('');
+    setPinStatus('IDLE');
+    setAttemptsLeft(MAX_PIN_ATTEMPTS);
+    failAttemptsRef.current = 0;
+    lastPinStatusRef.current = '';
+    phaseRef.current = 'LOAD';
+    setTravelRoute(null);
+    tripAnim.setValue(0);
+    setCarPoint('parking');
+  };
+ 
+  // Handles a failed PIN attempt — decrements counter and cancels trip if max reached
+  const handlePinFail = () => {
+    setEnteredKeys('');
+    failAttemptsRef.current += 1;
+    const left = Math.max(0, MAX_PIN_ATTEMPTS - failAttemptsRef.current);
+    setAttemptsLeft(left);
+    Alert.alert('Wrong PIN', `Attempts left: ${left}`);
+ 
+    if (failAttemptsRef.current >= MAX_PIN_ATTEMPTS) {
+      Alert.alert('Cancelled', 'Wrong PIN entered 3 times.');
+      addStatus('PIN failed 3 times. Flow cancelled.');
+      resetFlow();
+      return false;
+    }
+    return true;
+  };
+ 
+  // Starts polling the Arduino for PIN status updates
+  // In proxy mode, simulates the sequence with a timer instead
+  const startPinPolling = () => {
+    clearPinPolling();
+ 
+    if (proxyMode) {
+      // Simulate PIN flow sequence for demo purposes
+      const sequence =
+        phaseRef.current === 'LOAD'
+          ? ['WAIT', 'OK_OPENING', 'PLACE_PARCEL', 'PARCEL_DETECTED_WAIT_5S', 'CLOSED']
+          : ['WAIT', 'OK_OPENING', 'TAKE_PARCEL', 'PARCEL_REMOVED_WAIT_5S', 'CLOSED'];
+ 
+      let i = 0;
+      pinPollRef.current = setInterval(() => {
+        const st = sequence[Math.min(i, sequence.length - 1)];
+        setPinStatus(st);
+        setEnteredKeys(phaseRef.current === 'LOAD' ? pickupPinCode : destPinCode);
+        i += 1;
+ 
+        if (st === 'OK_OPENING') {
+          addStatus('Correct PIN. Doors opening.');
+          Alert.alert('Correct PIN', 'Doors opening');
+        }
+        if (st === 'PARCEL_DETECTED_WAIT_5S') {
+          addStatus('Parcel detected. Door will close in 5 seconds.');
+          Alert.alert('Parcel Detected', 'Parcel placed. Door will close in 5 seconds.');
+        }
+        if (st === 'PARCEL_REMOVED_WAIT_5S') {
+          addStatus('Parcel removed. Door will close in 5 seconds.');
+          Alert.alert('Parcel Removed', 'Parcel removed. Door will close in 5 seconds.');
+        }
+        if (st === 'CLOSED') {
+          clearPinPolling();
+          // Advance to next flow step after door closes
+          if (phaseRef.current === 'LOAD') {
+            addStatus('Pickup closed. Enter destination now.');
+            setCurrentView('destinationInput');
+          } else {
+            addStatus('Destination closed. Ready to send back to parking.');
+            setCurrentView('returnParking');
+          }
+        }
+      }, 1000);
+      return;
+    }
+ 
+    // Real Arduino polling — calls /pin-feed and /pin-status every 350ms
+    pinPollRef.current = setInterval(async () => {
+      try {
+        const [feedRes, statRes] = await Promise.all([
+          fetchWithTimeout(`${ARDUINO_BASE_URL}/pin-feed`, 1200),
+          fetchWithTimeout(`${ARDUINO_BASE_URL}/pin-status`, 1200),
+        ]);
+ 
+        // Update the displayed PIN input feed
+        if (feedRes.ok) setEnteredKeys((await feedRes.text()).trim());
+ 
+        if (!statRes.ok) return;
+        const st = (await statRes.text()).trim().toUpperCase();
+        setPinStatus(st);
+ 
+        // Only process each status change once
+        if (st === lastPinStatusRef.current) return;
+        lastPinStatusRef.current = st;
+ 
+        // Handle each possible status value
+        if (st === 'OK_OPENING') {
+          addStatus('Correct PIN. Doors opening.');
+          Alert.alert('Correct PIN', 'Doors opening');
+        }
+ 
+        if (st === 'FAIL') {
+          // Wrong PIN entered — clear feed and handle attempt logic
+          setEnteredKeys('');
+          await fetchWithTimeout(`${ARDUINO_BASE_URL}/clear-feed`, 1200).catch(() => {});
+          handlePinFail();
+          return;
+        }
+ 
+        if (st === 'PARCEL_DETECTED_WAIT_5S') {
+          addStatus('Parcel detected. Door will close in 5 seconds.');
+          Alert.alert('Parcel Detected', 'Parcel placed. Door will close in 5 seconds.');
+        }
+ 
+        if (st === 'PARCEL_REMOVED_WAIT_5S') {
+          addStatus('Parcel removed. Door will close in 5 seconds.');
+          Alert.alert('Parcel Removed', 'Parcel removed. Door will close in 5 seconds.');
+        }
+ 
+        if (st === 'CLOSED') {
+          // Door has closed — advance to next stage of delivery
+          clearPinPolling();
+          if (phaseRef.current === 'LOAD') {
+            addStatus('Pickup closed. Enter destination now.');
+            setCurrentView('destinationInput');
+          } else {
+            addStatus('Destination closed. Ready to send back to parking.');
+            setCurrentView('returnParking');
+          }
+        }
+      } catch {} // Silently ignore network errors during polling
+    }, 350);
+  };
+ 
+  // ============================================================
+  // DELIVERY FLOW HANDLERS
+  // ============================================================
+ 
+  // Handles the start of a delivery — sends robot to pickup point
+  const handleStartPickup = async () => {
+    const pickup = pickupInput.trim();
+ 
+    if (!isValidPoint(pickup)) {
+      Alert.alert('Invalid input', 'Pickup must be 1, 2, 3, or 4.');
+      return;
+    }
+    if (!proxyMode && !arduinoConnected) {
+      Alert.alert('Arduino not connected', 'Connect first.');
+      return;
+    }
+ 
+    // Generate a random 4-digit binary PIN for the sender
+    const pincode = randomBinaryPin(PIN_LENGTH);
+    setPickupPinCode(pincode);
+    setEnteredKeys('');
+    setPinStatus('WAIT');
+    setPickupKey(pickup);
+    setDestinationKey(null);
+    setAttemptsLeft(MAX_PIN_ATTEMPTS);
+    failAttemptsRef.current = 0;
+    lastPinStatusRef.current = '';
+    phaseRef.current = 'LOAD'; // This is the loading phase
+ 
+    try {
+      addStatus(`Sending car to pickup ${pickup}...`);
+      setCurrentView('tripToPickup');
+ 
+      if (!proxyMode) {
+        // Send PIN to Arduino (load mode = sender placing parcel)
+        const setPin = await fetchWithTimeout(
+          `${ARDUINO_BASE_URL}/set-pin?code=${encodeURIComponent(pincode)}&mode=load`,
+          3000
+        );
+        if (!setPin.ok) throw new Error('set-pin failed');
+ 
+        await fetchWithTimeout(`${ARDUINO_BASE_URL}/clear-feed`, 1200).catch(() => {});
+ 
+        // Command robot to move and wait for arrival
+        await goToPointReliable(pickup);
+        await Promise.all([
+          waitUntilIdleAt(pickup, 90000), // Wait for Arduino to confirm arrival
+          animateCarTo(pickup, 3500),      // Animate car icon on map simultaneously
+        ]);
+      } else {
+        await animateCarTo(pickup, 2200); // Proxy mode: animation only
+      }
+ 
+      addStatus(`Reached pickup ${pickup}. Enter pickup PIN.`);
+      setCurrentView('pickupPin');
+      startPinPolling(); // Begin monitoring PIN input
+    } catch (e) {
+      Alert.alert('Pickup error', String(e?.message || 'Could not start pickup flow.'));
+      resetFlow();
+    }
+  };
+ 
+  // Handles navigation to the destination after parcel is loaded
+  const handleSendDestination = async () => {
+    const d = destinationInput.trim();
+ 
+    if (!isValidPoint(d)) {
+      Alert.alert('Invalid input', 'Destination must be 1, 2, 3, or 4.');
+      return;
+    }
+    if (pickupKey && d === pickupKey) {
+      Alert.alert('Invalid input', 'Destination cannot be same as pickup.');
+      return;
+    }
+ 
+    setDestinationKey(d);
+ 
+    try {
+      setCurrentView('tripToDestination');
+      addStatus(`Driving to destination ${d}`);
+ 
+      if (!proxyMode) {
+        await goToPointReliable(d);
+        await Promise.all([
+          waitUntilIdleAt(d, 90000),
+          animateCarTo(d, 4000),
+        ]);
+      } else {
+        await animateCarTo(d, 2400);
+      }
+ 
+      // Generate a new PIN for the recipient (unload mode)
+      const destCode = randomBinaryPin(PIN_LENGTH);
+      setDestPinCode(destCode);
+      setEnteredKeys('');
+      setPinStatus('WAIT');
+      setAttemptsLeft(MAX_PIN_ATTEMPTS);
+      failAttemptsRef.current = 0;
+      lastPinStatusRef.current = '';
+      phaseRef.current = 'UNLOAD'; // Switch to unloading phase
+ 
+      if (!proxyMode) {
+        const setPin = await fetchWithTimeout(
+          `${ARDUINO_BASE_URL}/set-pin?code=${encodeURIComponent(destCode)}&mode=unload`,
+          3000
+        );
+        if (!setPin.ok) throw new Error('destination pin setup failed');
+        await fetchWithTimeout(`${ARDUINO_BASE_URL}/clear-feed`, 1200).catch(() => {});
+      }
+ 
+      addStatus('Destination reached. Enter destination PIN.');
+      setCurrentView('destinationPin');
+      startPinPolling(); // Begin monitoring recipient PIN input
+    } catch (e) {
+      Alert.alert('Navigation failed', String(e?.message || 'Could not move to destination.'));
+      resetFlow();
+    }
+  };
+ 
+  // Sends the robot back to the parking position after delivery is complete
+  const handleSendBackToParking = async () => {
+    try {
+      addStatus('Sending Bebo to parking...');
+      setCurrentView('returningParking');
+ 
+      if (!proxyMode) {
+        await goParkingReliable();
+        await Promise.all([
+          waitUntilIdleAt(0, 90000),
+          animateCarTo('parking', 3000),
+        ]);
+      } else {
+        await animateCarTo('parking', 2200);
+      }
+ 
+      setCurrentView('home');
+      addStatus('Reached parking');
+      setRatingModalVisible(true); // Show rating modal after successful delivery
+    } catch (e) {
+      Alert.alert('Parking failed', String(e?.message || 'Could not send to parking.'));
+    }
+  };
+ 
+  // ============================================================
+  // CONTROL HANDLERS
+  // ============================================================
+ 
+  // Cancels the current trip and returns to home screen
+  const handleCancelTrip = async () => {
+    clearPinPolling();
+    if (!proxyMode) await fetchWithTimeout(`${ARDUINO_BASE_URL}/stop`, 1200).catch(() => {});
+    addStatus('Trip cancelled by user');
+    Alert.alert('Trip Cancelled', 'The trip has been cancelled.');
+    resetFlow();
+  };
+ 
+  // Immediately stops the robot (emergency use)
+  const handleEmergencyStop = async () => {
+    clearPinPolling();
+    if (!proxyMode) await fetchWithTimeout(`${ARDUINO_BASE_URL}/stop`, 1200).catch(() => {});
+    setTravelRoute(null);
+    tripAnim.stopAnimation();
+    addStatus('Emergency STOP triggered');
+    Alert.alert('Emergency Stop', 'Vehicle has been stopped immediately.');
+    setCurrentView('home');
+  };
+ 
+  // Connects to the Arduino via WiFi by pinging its IP address
+  const connectArduino = async () => {
+    if (proxyMode) {
+      // In proxy mode, skip actual network connection
+      setArduinoConnected(true);
+      addStatus('Proxy mode connected');
+      Alert.alert('Proxy Mode', 'Demo mode active (no Arduino required).');
+      return;
+    }
+ 
+    if (!arduinoIp.trim()) {
+      Alert.alert('Missing IP', 'Enter Arduino IP first.');
+      return;
+    }
+ 
+    try {
+      const ping = await fetchWithTimeout(`${ARDUINO_BASE_URL}/ping`, 2500);
+      const txt = (await ping.text()).trim().toUpperCase();
+      if (!(ping.ok && (txt === 'PONG' || txt === 'OK'))) throw new Error();
+ 
+      // Reset Arduino state on connection
+      await fetchWithTimeout(`${ARDUINO_BASE_URL}/set-parking`, 2500).catch(() => {});
+      await fetchWithTimeout(`${ARDUINO_BASE_URL}/clear-feed`, 1200).catch(() => {});
+ 
+      setArduinoConnected(true);
+      setCarPoint('parking');
+      addStatus(`Connected to ${arduinoIp}`);
+      Alert.alert('Connected', `Connected to ${arduinoIp}`);
+    } catch {
+      setArduinoConnected(false);
+      Alert.alert('Connection failed', `Could not reach ${arduinoIp}`);
+    }
+  };
+ 
+  // Disconnects from the Arduino and stops the robot
+  const disconnectArduino = async () => {
+    clearPinPolling();
+    if (!proxyMode) await fetchWithTimeout(`${ARDUINO_BASE_URL}/stop`, 1200).catch(() => {});
+    setArduinoConnected(false);
+    addStatus(proxyMode ? 'Proxy mode disconnected' : 'Disconnected');
+  };
+ 
+  // Manually resets the robot's stored position to parking without physical movement
+  const handleSetParking = async () => {
+    if (proxyMode) {
+      setCarPoint('parking');
+      addStatus('Parking set (proxy)');
+      Alert.alert('Set Parking', 'Parking reset in proxy mode.');
+      return;
+    }
+ 
+    try {
+      const res = await fetchWithTimeout(`${ARDUINO_BASE_URL}/set-parking`, 2500);
+      if (!res.ok) throw new Error();
+      setCarPoint('parking');
+      addStatus('Parking set successfully');
+      Alert.alert('Set Parking', 'Bebo parking position has been reset.');
+    } catch {
+      Alert.alert('Set Parking Failed', 'Could not call /set-parking');
+    }
+  };
+ 
+  // ============================================================
+  // CLEANUP
+  // Clear polling interval when component unmounts
+  // ============================================================
+  useEffect(() => () => {
+    clearPinPolling();
+  }, []);
+ 
+  // ============================================================
+  // MAP ANIMATION INTERPOLATION
+  // Calculates pixel positions for the car icon during animation
+  // ============================================================
+  const parkingPos = toPx('parking');
+  const staticCarPos = toPx(currentCarPoint);
+  const movingFromPos = travelRoute ? toPx(travelRoute.from) : staticCarPos;
+  const movingToPos   = travelRoute ? toPx(travelRoute.to)   : staticCarPos;
+ 
+  // Interpolates X position from source to destination as tripAnim goes 0→1
+  const tripX = tripAnim.interpolate({
+    inputRange: [0, 1],
+    outputRange: [movingFromPos.x - CAR_SIZE / 2, movingToPos.x - CAR_SIZE / 2],
+  });
+ 
+  // Interpolates Y position from source to destination as tripAnim goes 0→1
+  const tripY = tripAnim.interpolate({
+    inputRange: [0, 1],
+    outputRange: [movingFromPos.y - CAR_SIZE / 2, movingToPos.y - CAR_SIZE / 2],
+  });
+ 
+  // Wait for fonts to load before rendering
+  if (!fontsLoaded) return null;
+ 
+  // ============================================================
+  // LOGIN SCREEN
+  // Shown before the user enters their name
+  // ============================================================
+  if (!nameSubmitted) {
+    return (
+      <View style={[styles.loginContainer, { backgroundColor: isDarkMode ? '#111827' : '#6d28d9' }]}>
+        <View style={[styles.loginCard, { backgroundColor: isDarkMode ? '#1f2937' : '#fff' }]}>
+          <View style={[styles.logoCircle, { backgroundColor: isDarkMode ? '#0f172a' : '#6d28d9' }]}>
+            <Car color="#fff" size={40} />
+          </View>
+          <Text style={[styles.title, { color: theme.text }]}>Bebo Delivery</Text>
+          <Text style={[styles.subtitle, { color: theme.subText }]}>Autonomous Package Service</Text>
+          <TextInput
+            value={userName}
+            onChangeText={setUserName}
+            placeholder="Enter your name"
+            placeholderTextColor="#94a3b8"
+            style={[styles.input, { backgroundColor: theme.inputBg, borderColor: theme.border, color: theme.text }]}
+          />
+          <Pressable
+            style={[styles.primaryButton, !userName.trim() && styles.disabledButton]}
+            disabled={!userName.trim()}
+            onPress={() => setNameSubmitted(true)} // Proceed to main app
+          >
+            <Text style={styles.primaryButtonText}>Get Started</Text>
+          </Pressable>
+          <Pressable
+            style={[styles.secondaryButton, { marginTop: 10, backgroundColor: '#334155' }]}
+            onPress={() => setIsDarkMode((v) => !v)}
+          >
+            <Text style={styles.secondaryButtonText}>
+              {isDarkMode ? 'Switch to Light Theme' : 'Switch to Dark Theme'}
+            </Text>
+          </Pressable>
+        </View>
+      </View>
+    );
+  }
+ 
+  // ============================================================
+  // MAIN APP SCREEN
+  // ============================================================
+  return (
+    <View style={[styles.appContainer, { backgroundColor: theme.appBg }]}>
+ 
+      {/* App header bar */}
+      <View style={[styles.header, { backgroundColor: theme.headerBg }]}>
+        <Text style={[styles.headerText, { color: theme.text }]}>Bebo Delivery</Text>
+      </View>
+ 
+      {/* ---- MAP VIEW ---- */}
+      {/* Displays delivery points, parking, and the animated car icon */}
+      <View
+        style={[styles.mapContainer, { backgroundColor: theme.mapBg }]}
+        onLayout={(e) => {
+          const { width, height } = e.nativeEvent.layout;
+          setMapSize({ width, height }); // Capture map dimensions for coordinate calculations
+        }}
+      >
+        {/* Road lines (decorative) */}
+        <View style={styles.mapRoadHorizontal} />
+        <View style={styles.mapRoadVertical} />
+        <View style={styles.mapRoadHorizontalTwo} />
+        <View style={styles.mapRoadVerticalTwo} />
+ 
+        {/* Delivery point markers (1-4) */}
+        {['1', '2', '3', '4'].map((n) => (
+          <View
+            key={n}
+            style={[
+              styles.pointMarker,
+              { left: toPx(n).x - 14, top: toPx(n).y - 14, backgroundColor: isDarkMode ? '#0f172a' : '#fff' },
+            ]}
+          >
+            <Text style={[styles.pointText, { color: isDarkMode ? '#e2e8f0' : '#334155' }]}>{n}</Text>
+          </View>
+        ))}
+ 
+        {/* Parking position marker */}
+        <View style={[styles.parkingMarker, { left: parkingPos.x - 14, top: parkingPos.y - 14 }]}>
+          <Text style={styles.parkingText}>P</Text>
+        </View>
+ 
+        {/* Car icon — animated while moving, static when idle */}
+        {travelRoute ? (
+          <Animated.View style={[styles.carEmojiWrap, { transform: [{ translateX: tripX }, { translateY: tripY }] }]}>
+            <CarIcon size={CAR_SIZE} color={isDarkMode ? '#e5e7eb' : '#111827'} />
+          </Animated.View>
+        ) : (
+          <View style={[styles.carEmojiWrap, { left: staticCarPos.x - CAR_SIZE / 2, top: staticCarPos.y - CAR_SIZE / 2 }]}>
+            <CarIcon size={CAR_SIZE} color={isDarkMode ? '#e5e7eb' : '#111827'} />
+          </View>
+        )}
+ 
+        <Text style={[styles.mapLabel, { color: theme.subText }]}>Route Map</Text>
+      </View>
+ 
+      {/* ---- BOTTOM SHEET / CONTROL PANEL ---- */}
+      <View style={[styles.sheet, { backgroundColor: theme.panelBg }]}>
+        <ScrollView contentContainerStyle={{ paddingBottom: 40 }}>
+ 
+          {/* Progress bar showing delivery stages */}
+          <View style={[styles.progressBox, { backgroundColor: theme.cardBg }]}>
+            <Text style={[styles.wifiTitle, { color: theme.text }]}>Trip Progress</Text>
+            <View style={styles.progressBarRow}>
+              {progressSteps.map((_, idx) => (
+                <View
+                  key={idx}
+                  style={[
+                    styles.progressSegment,
+                    { backgroundColor: idx <= progressIndex ? '#4f46e5' : isDarkMode ? '#334155' : '#cbd5e1' },
+                  ]}
+                />
+              ))}
+            </View>
+            <Text style={[styles.infoText, { color: theme.subText }]}>Current: {progressSteps[progressIndex]}</Text>
+          </View>
+ 
+          {/* WiFi connection panel */}
+          <View style={[styles.wifiBlock, { backgroundColor: theme.cardBg }]}>
+            <Text style={[styles.wifiTitle, { color: theme.text }]}>Wi-Fi Connection</Text>
+            <TextInput
+              value={arduinoIp}
+              onChangeText={setArduinoIp}
+              placeholder="Arduino IP (e.g. 172.20.10.5)"
+              placeholderTextColor="#94a3b8"
+              autoCapitalize="none"
+              autoCorrect={false}
+              style={[styles.input, { backgroundColor: theme.inputBg, borderColor: theme.border, color: theme.text }]}
+            />
+            {/* Connect / Disconnect button */}
+            <Pressable
+              style={[styles.secondaryButton, { backgroundColor: arduinoConnected ? '#ef4444' : '#10b981' }]}
+              onPress={arduinoConnected ? disconnectArduino : connectArduino}
+            >
+              <Text style={styles.secondaryButtonText}>{arduinoConnected ? 'Disconnect' : 'Connect'}</Text>
+            </Pressable>
+ 
+            {/* Manually reset robot position to parking */}
+            <Pressable
+              style={[styles.secondaryButton, { backgroundColor: '#0ea5e9', marginTop: 8 }]}
+              onPress={handleSetParking}
+            >
+              <Text style={styles.secondaryButtonText}>Set Parking</Text>
+            </Pressable>
+ 
+            {/* Dark/light mode toggle */}
+            <Pressable
+              style={[styles.secondaryButton, { backgroundColor: '#334155', marginTop: 8 }]}
+              onPress={() => setIsDarkMode((v) => !v)}
+            >
+              <Text style={styles.secondaryButtonText}>
+                {isDarkMode ? 'Switch to Light Theme' : 'Switch to Dark Theme'}
+              </Text>
+            </Pressable>
+ 
+            {/* Proxy mode toggle (demo without Arduino) */}
+            <Pressable
+              style={[styles.secondaryButton, { backgroundColor: proxyMode ? '#16a34a' : '#64748b', marginTop: 8 }]}
+              onPress={() => {
+                setProxyMode((v) => !v);
+                setArduinoConnected(false);
+                addStatus(`Proxy mode ${!proxyMode ? 'enabled' : 'disabled'}`);
+              }}
+            >
+              <Text style={styles.secondaryButtonText}>{proxyMode ? 'Proxy Mode: ON' : 'Proxy Mode: OFF'}</Text>
+            </Pressable>
+          </View>
+ 
+          {/* Cancel / Emergency stop buttons — shown only during active trip */}
+          {isTripActive && (
+            <View style={[styles.wifiBlock, { backgroundColor: theme.cardBg }]}>
+              <Text style={[styles.wifiTitle, { color: theme.text }]}>Trip Controls</Text>
+              <View style={styles.tripControlRow}>
+                <Pressable style={[styles.tripControlBtn, { backgroundColor: '#f59e0b' }]} onPress={handleCancelTrip}>
+                  <Text style={styles.secondaryButtonText}>Cancel Trip</Text>
+                </Pressable>
+                <Pressable style={[styles.tripControlBtn, { backgroundColor: '#dc2626' }]} onPress={handleEmergencyStop}>
+                  <Text style={styles.secondaryButtonText}>Emergency Stop</Text>
+                </Pressable>
+              </View>
+            </View>
+          )}
+ 
+          {/* Home screen — pickup point input */}
+          {currentView === 'home' && (
+            <View style={styles.section}>
+              <Text style={[styles.sectionTitle, { color: theme.text }]}>Pickup Point</Text>
+              <TextInput
+                placeholder="Pickup (1-4)"
+                placeholderTextColor="#94a3b8"
+                value={pickupInput}
+                onChangeText={(v) => setPickupInput(sanitizePointInput(v))}
+                keyboardType="number-pad"
+                maxLength={1}
+                style={[styles.input, { backgroundColor: theme.inputBg, borderColor: theme.border, color: theme.text }]}
+              />
+              <Pressable
+                style={[styles.primaryButton, !isValidPoint(pickupInput) && styles.disabledButton]}
+                disabled={!isValidPoint(pickupInput)}
+                onPress={handleStartPickup}
+              >
+                <Text style={styles.primaryButtonText}>Send Car To Pickup</Text>
+              </Pressable>
+            </View>
+          )}
+ 
+          {/* Pickup PIN screen — displays PIN code and live key feed */}
+          {currentView === 'pickupPin' && (
+            <View style={styles.section}>
+              <Text style={[styles.sectionTitle, { color: theme.text }]}>Pickup PIN</Text>
+              <Text style={[styles.infoText, { color: theme.subText }]}>Code:</Text>
+              <Text style={[styles.pinValue, { color: theme.text }]}>{pickupPinCode}</Text>
+              <Text style={[styles.infoText, { color: theme.subText }]}>Keys pressed: {enteredKeys || '-'}</Text>
+              <Text style={[styles.infoText, { color: theme.subText }]}>Status: {pinStatus}</Text>
+              <Text style={[styles.infoText, { color: theme.subText }]}>Attempts left: {attemptsLeft}/3</Text>
+            </View>
+          )}
+ 
+          {/* Destination input screen */}
+          {currentView === 'destinationInput' && (
+            <View style={styles.section}>
+              <Text style={[styles.sectionTitle, { color: theme.text }]}>Enter Destination</Text>
+              <TextInput
+                placeholder="Destination (1-4)"
+                placeholderTextColor="#94a3b8"
+                value={destinationInput}
+                onChangeText={(v) => setDestinationInput(sanitizePointInput(v))}
+                keyboardType="number-pad"
+                maxLength={1}
+                style={[styles.input, { backgroundColor: theme.inputBg, borderColor: theme.border, color: theme.text }]}
+              />
+              <Pressable
+                style={[styles.primaryButton, !isValidPoint(destinationInput) && styles.disabledButton]}
+                disabled={!isValidPoint(destinationInput)}
+                onPress={handleSendDestination}
+              >
+                <Text style={styles.primaryButtonText}>Start Destination Trip</Text>
+              </Pressable>
+            </View>
+          )}
+ 
+          {/* Destination PIN screen — displays PIN and live key feed for recipient */}
+          {currentView === 'destinationPin' && (
+            <View style={styles.section}>
+              <Text style={[styles.sectionTitle, { color: theme.text }]}>Destination PIN</Text>
+              <Text style={[styles.infoText, { color: theme.subText }]}>Code:</Text>
+              <Text style={[styles.pinValue, { color: theme.text }]}>{destPinCode}</Text>
+              <Text style={[styles.infoText, { color: theme.subText }]}>Keys pressed: {enteredKeys || '-'}</Text>
+              <Text style={[styles.infoText, { color: theme.subText }]}>Status: {pinStatus}</Text>
+              <Text style={[styles.infoText, { color: theme.subText }]}>Attempts left: {attemptsLeft}/3</Text>
+            </View>
+          )}
+ 
+          {/* Return to parking screen — shown after successful unload */}
+          {currentView === 'returnParking' && (
+            <View style={styles.section}>
+              <Text style={[styles.sectionTitle, { color: theme.text }]}>Delivery Complete</Text>
+              <Pressable style={styles.primaryButton} onPress={handleSendBackToParking}>
+                <Text style={styles.primaryButtonText}>Send Bebo back to Parking</Text>
+              </Pressable>
+            </View>
+          )}
+ 
+          {/* Timeline log of delivery events */}
+          <View style={[styles.timelineBox, { backgroundColor: theme.cardBg }]}>
+            <Text style={[styles.timelineTitle, { color: theme.text }]}>Timeline</Text>
+            {timeline.map((t, i) => (
+              <Text key={`${t}-${i}`} style={[styles.timelineItem, { color: theme.subText }]}>
+                {t}
+              </Text>
+            ))}
+          </View>
+        </ScrollView>
+      </View>
+ 
+      {/* ---- RATING MODAL ---- */}
+      {/* Appears after robot returns to parking — asks user to rate 1-5 */}
+      <Modal transparent visible={ratingModalVisible} animationType="fade">
+        <View style={styles.modalBackdrop}>
+          <View style={[styles.modalCard, { backgroundColor: theme.cardBg }]}>
+            <Text style={[styles.modalTitle, { color: theme.text }]}>
+              Rate your experience, {userName || 'Customer'}
+            </Text>
+            <View style={styles.ratingRow}>
+              {[1, 2, 3, 4, 5].map((r) => (
+                <Pressable
+                  key={r}
+                  onPress={() => setRating(r)}
+                  style={[styles.ratingDot, rating === r && { backgroundColor: '#4f46e5' }]} // Highlight selected rating
+                >
+                  <Text style={[styles.ratingText, { color: theme.text }]}>{r}</Text>
+                </Pressable>
+              ))}
+            </View>
+            <Pressable
+              style={styles.primaryButton}
+              onPress={() => {
+                setRatingModalVisible(false);
+                addStatus(`Rating submitted by ${userName || 'Customer'}: ${rating ?? 'N/A'}`);
+                resetFlow(); // Return app to initial state
+              }}
+            >
+              <Text style={styles.primaryButtonText}>Submit</Text>
+            </Pressable>
+          </View>
+        </View>
+      </Modal>
+    </View>
+  );
+}
+ 
+// ============================================================
+// STYLESHEET
+// All component styles defined using React Native StyleSheet
+// ============================================================
+const styles = StyleSheet.create({
+  appContainer: { flex: 1, backgroundColor: '#f3f4f6' },
+  loginContainer: { flex: 1, backgroundColor: '#6d28d9', alignItems: 'center', justifyContent: 'center', padding: 20 },
+  loginCard: { backgroundColor: '#fff', borderRadius: 24, padding: 24, width: '100%', maxWidth: 420 },
+  logoCircle: { width: 80, height: 80, borderRadius: 40, backgroundColor: '#6d28d9', alignItems: 'center', justifyContent: 'center', alignSelf: 'center', marginBottom: 12 },
+  title: { fontSize: 28, fontFamily: 'Sora_700Bold', textAlign: 'center' },
+  subtitle: { fontSize: 14, textAlign: 'center', color: '#555', marginBottom: 16, fontFamily: 'Sora_400Regular' },
+  header: { padding: 10, backgroundColor: '#fff' },
+  headerText: { fontSize: 16, fontFamily: 'Sora_700Bold', color: '#111827' },
+  input: { borderWidth: 1, borderColor: '#e5e7eb', borderRadius: 12, padding: 12, marginBottom: 10, backgroundColor: '#fff', fontFamily: 'Sora_400Regular' },
+  primaryButton: { backgroundColor: '#4f46e5', padding: 14, borderRadius: 12, alignItems: 'center' },
+  primaryButtonText: { color: '#fff', fontFamily: 'Sora_600SemiBold' },
+  secondaryButton: { paddingHorizontal: 12, paddingVertical: 8, borderRadius: 10, alignSelf: 'flex-start' },
+  secondaryButtonText: { color: '#fff', fontFamily: 'Sora_600SemiBold', fontSize: 12 },
+  disabledButton: { opacity: 0.5 },
+  mapContainer: { flex: 1, backgroundColor: '#e8edf3', alignItems: 'center', justifyContent: 'center' },
+  mapRoadHorizontal: { position: 'absolute', top: '35%', width: '100%', height: 6, backgroundColor: 'rgba(148,163,184,0.25)' },
+  mapRoadHorizontalTwo: { position: 'absolute', top: '65%', width: '100%', height: 6, backgroundColor: 'rgba(148,163,184,0.2)' },
+  mapRoadVertical: { position: 'absolute', left: '35%', height: '100%', width: 6, backgroundColor: 'rgba(148,163,184,0.25)' },
+  mapRoadVerticalTwo: { position: 'absolute', left: '65%', height: '100%', width: 6, backgroundColor: 'rgba(148,163,184,0.2)' },
+  pointMarker: { position: 'absolute', width: 28, height: 28, borderRadius: 14, backgroundColor: '#fff', borderWidth: 2, borderColor: '#64748b', alignItems: 'center', justifyContent: 'center' },
+  pointText: { fontFamily: 'Sora_600SemiBold', color: '#334155' },
+  parkingMarker: { position: 'absolute', width: 28, height: 28, borderRadius: 14, backgroundColor: '#fef3c7', borderWidth: 2, borderColor: '#f59e0b', alignItems: 'center', justifyContent: 'center' },
+  parkingText: { fontFamily: 'Sora_600SemiBold', color: '#92400e' },
+  carEmojiWrap: { position: 'absolute', left: 0, top: 0 },
+  mapLabel: { position: 'absolute', bottom: 12, color: '#6b7280', fontFamily: 'Sora_400Regular' },
+  sheet: { maxHeight: screenHeight * 0.62, backgroundColor: 'rgba(255,255,255,0.9)', borderTopLeftRadius: 24, borderTopRightRadius: 24, padding: 16 },
+  wifiBlock: { borderRadius: 12, padding: 12, marginBottom: 12, backgroundColor: '#f8fafc' },
+  wifiTitle: { fontFamily: 'Sora_700Bold', fontSize: 14, marginBottom: 8, color: '#111827' },
+  progressBox: { borderRadius: 12, padding: 12, marginBottom: 12 },
+  progressBarRow: { flexDirection: 'row', gap: 6, marginBottom: 8 },
+  progressSegment: { flex: 1, height: 8, borderRadius: 999 },
+  section: { gap: 10 },
+  sectionTitle: { fontSize: 20, fontFamily: 'Sora_700Bold', color: '#111827' },
+  infoText: { fontSize: 14, color: '#444', fontFamily: 'Sora_400Regular' },
+  pinValue: { fontFamily: 'Sora_700Bold', fontSize: 22, color: '#111827', marginBottom: 8 },
+  tripControlRow: { flexDirection: 'row', gap: 8 },
+  tripControlBtn: { flex: 1, alignItems: 'center', borderRadius: 10, paddingVertical: 10 },
+  timelineBox: { marginTop: 16, backgroundColor: '#f8fafc', borderRadius: 12, padding: 12 },
+  timelineTitle: { fontFamily: 'Sora_700Bold', marginBottom: 8, color: '#0f172a' },
+  timelineItem: { fontFamily: 'Sora_400Regular', color: '#475569', fontSize: 12, marginBottom: 4 },
+  ratingRow: { flexDirection: 'row', gap: 8, marginTop: 8, marginBottom: 8 },
+  ratingDot: { width: 36, height: 36, borderRadius: 18, backgroundColor: '#e5e7eb', alignItems: 'center', justifyContent: 'center' },
+  ratingText: { fontFamily: 'Sora_600SemiBold', color: '#111827' },
+  modalBackdrop: { flex: 1, backgroundColor: 'rgba(0,0,0,0.45)', alignItems: 'center', justifyContent: 'center', padding: 20 },
+  modalCard: { width: '100%', maxWidth: 360, backgroundColor: '#fff', borderRadius: 16, padding: 20 },
+  modalTitle: { fontFamily: 'Sora_700Bold', fontSize: 18, marginBottom: 6 },
+});
