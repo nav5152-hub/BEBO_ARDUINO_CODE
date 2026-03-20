@@ -1,0 +1,976 @@
+#include <WiFiS3.h>   // WiFi library for Arduino UNO R4 WiFi
+#include <Servo.h>    // Servo motor control library
+
+// ---------- WiFi Credentials ----------
+const char* WIFI_SSID = "PleaseConnect";   // Hotspot SSID
+const char* WIFI_PASS = "arko12345";       // Hotspot password
+WiFiServer server(80);                     // HTTP server on port 80
+
+// WiFi reconnection timing
+unsigned long lastWifiRetryMs = 0;
+const unsigned long WIFI_RETRY_MS = 5000; // Retry every 5 seconds if disconnected
+bool serverStarted = false;               // Tracks whether HTTP server has been started
+
+// ---------- Motor Driver Pins (L298N) ----------
+const int PIN_IN1 = 10;
+const int PIN_IN2 = 11;
+const int PIN_IN3 = 12;
+const int PIN_IN4 = 13;
+
+// ---------- PIN Input (Switch-based password system) ----------
+const int SWITCH_ONE_PIN  = 9;   // Switch that inputs binary '1'
+const int SWITCH_ZERO_PIN = 0;   // Switch that inputs binary '0'
+const int MOCK_OUTPUT_PIN = -1;  // Optional debug output pin (-1 = disabled)
+
+// ---------- Servo, Pressure Sensor, Buzzer ----------
+const int SERVO1_PIN          = A2;  // First servo motor 
+const int SERVO2_PIN          = A3;  // Second servo motor 
+const int PRESSURE_SENSOR_PIN = A0;  // Pressure sensor 
+const int BUZZER_PIN          = 3;   // Active buzzer 
+
+// ---------- Ambient Light Control (LDR + LEDs) ----------
+const int LDR_PIN            = A5;   // LDR sensor analog input
+const int DARK_THRESHOLD     = 700;  // ADC value below which environment is considered dark
+const bool DARK_WHEN_LDR_LOW = true; // True = dark when LDR value is LOW
+const bool LED_ACTIVE_LOW    = true; // True = LED turns ON when pin is LOW
+
+const int AMBIENT_LED1_PIN = 5;  // First ambient LED (yellow)
+const int AMBIENT_LED2_PIN = 6;  // Second ambient LED (yellow)
+const int DOOR_LED_PIN     = 1;  // White LED indicates door is unlocked
+
+// ---------- Ultrasonic Sensors (HC-SR04) ----------
+const int US_FRONT_TRIG = 4;  // Front ultrasonic trigger pin
+const int US_FRONT_ECHO = 2;  // Front ultrasonic echo pin
+const int US_BACK_TRIG  = 8;  // Rear ultrasonic trigger pin
+const int US_BACK_ECHO  = 7;  // Rear ultrasonic echo pin
+
+// Servo objects for door mechanism
+Servo servo1, servo2;
+
+// ---------- Motion Timing Constants ----------
+const unsigned long TURN_45_MS         = 320;  // Time required to turn 45 degrees
+const unsigned long TURN_TRIM_RIGHT_MS = 130;  // Small right trim correction
+const unsigned long TURN_TRIM_LEFT_MS  = 70;   // Small left trim correction
+const unsigned long DRIVE_DIAG_MS      = 2000; // Time to drive to a delivery point
+const unsigned long CENTER_PAUSE_MS    = 250;  // Brief pause when returning to centre
+const int HOME_HEADING_DEG = 0;                // Default heading angle (degrees)
+
+// ---------- Lock & Flow Timing ----------
+const unsigned long DEBOUNCE_MS    = 40;    // Switch debounce time in milliseconds
+const unsigned long BLINK_MS       = 250;   // Buzzer blink interval
+const int BLINK_TOGGLES            = 8;     // Number of buzzer blinks before door opens
+const unsigned long CLOSE_DELAY_MS = 5000; // Door stays open for 5 seconds after parcel event
+const int PRESSURE_THRESHOLD       = 15;   // ADC threshold for parcel detection (below = present)
+
+// ---------- Servo Angles ----------
+// Servo1 and Servo2 work together to open/close the compartment door
+const int SERVO1_LOCK_ANGLE   = 0;    // Servo1 angle when door is locked
+const int SERVO1_UNLOCK_ANGLE = 90;   // Servo1 angle when door is open
+const int SERVO2_LOCK_ANGLE   = 180;  // Servo2 angle when door is locked
+const int SERVO2_UNLOCK_ANGLE = 90;   // Servo2 angle when door is open
+
+// ---------- Motion Plan Action Types ----------
+const uint8_t ACT_NONE            = 0;
+const uint8_t ACT_FORWARD         = 1;
+const uint8_t ACT_REVERSE         = 2;
+const uint8_t ACT_TURN_LEFT_45    = 3;
+const uint8_t ACT_TURN_RIGHT_45   = 4;
+const uint8_t ACT_WAIT            = 5;
+const uint8_t ACT_TURN_RIGHT_TRIM = 6;
+const uint8_t ACT_TURN_LEFT_TRIM  = 7;
+
+// ---------- Motion Plan Storage ----------
+const int MAX_PLAN = 48;          // Maximum number of steps in a single plan
+uint8_t planType[MAX_PLAN];       // Array storing the action type for each step
+unsigned long planDur[MAX_PLAN];  // Array storing the duration (ms) for each step
+int planCount = 0;                // Total number of steps in the current plan
+int planIndex = 0;                // Index of the currently executing step
+bool actionRunning = false;       // True if a step is currently being executed
+unsigned long actionStartMs = 0;  // Timestamp when the current step started
+
+// ---------- Progress Tracking ----------
+bool carMoving = false;           // True if the robot is currently moving
+int progressPct = 0;              // Delivery progress percentage (0-100)
+int totalProgressActions = 0;     // Total number of progress-counted steps
+int doneProgressActions = 0;      // Number of completed progress-counted steps
+
+// ---------- Position & Heading ----------
+int currentPoint = 0;    // Current delivery point (0 = home/parking)
+int targetPoint = 0;     // Target delivery point
+int headingDeg = HOME_HEADING_DEG; // Current heading in degrees
+
+// ---------- LDR / Ambient LED State ----------
+int ldrRawValue = 0;         // Raw analog reading from LDR sensor
+bool ambientLedsOn = false;  // True if ambient LEDs are currently ON
+String ambientLabel = "LIGHT"; // Human-readable light status ("LIGHT" or "DARK")
+
+// ---------- PIN / Lock State ----------
+String correctPattern = "1010"; // The correct PIN pattern (binary string)
+String inputPattern   = "";     // Currently entered PIN digits
+String typedFeed      = "";     // Last 24 digits typed (for app display)
+String pinStatus = "IDLE";      // Current PIN/lock status sent to app
+
+// ---------- Switch Debounce State ----------
+int lastOneReading  = HIGH;
+int lastZeroReading = HIGH;
+unsigned long lastOneDebounce  = 0;
+unsigned long lastZeroDebounce = 0;
+
+// ---------- Door Flow State Machine ----------
+// Controls the sequence: buzzer alert → door open → wait for parcel → door close
+enum FlowState {
+  FLOW_IDLE = 0,         // No active flow
+  FLOW_ALERT,            // Buzzer blinking before door opens
+  FLOW_OPEN_WAIT_SENSOR, // Door open, waiting for parcel placed/removed
+  FLOW_PARCEL_DELAY,     // Parcel detected, waiting 5s before closing
+  FLOW_DONE              // Flow complete, door closed
+};
+FlowState flowState = FLOW_IDLE;
+unsigned long flowTimer = 0; // Timestamp for flow timing
+int blinkCount = 0;          // Number of buzzer blink toggles completed
+bool blinkOn = false;        // Current buzzer blink state
+
+// ---------- Parcel Mode ----------
+// Determines whether door flow is for loading (sender) or unloading (recipient)
+enum ParcelMode {
+  PARCEL_MODE_LOAD   = 0, // Sender placing a parcel
+  PARCEL_MODE_UNLOAD = 1  // Recipient retrieving a parcel
+};
+ParcelMode parcelMode = PARCEL_MODE_LOAD;
+
+// ---------- Obstacle Avoidance Constants ----------
+const int OBSTACLE_CM_THRESHOLD     = 20;  // Distance (cm) at which obstacle is detected
+const unsigned long AVOID_TURN_MS   = 520; // Duration of each avoidance turn
+const unsigned long AVOID_SHIFT_MS  = 550; // Duration of lateral shift during avoidance
+const unsigned long AVOID_PASS_MS   = 900; // Duration of forward pass around the obstacle
+const unsigned long AVOID_COOLDOWN_MS = 300; // Cooldown after avoidance before re-checking
+const unsigned long OBSTACLE_CHECK_MS = 60; // How often to check for obstacles (ms)
+const unsigned long AVOID_PASS_DISTANCE_CREDIT_MS = AVOID_PASS_MS; // Credits forward distance during avoidance pass
+
+// ---------- Obstacle Avoidance State Machine ----------
+// Eight-step sequence to navigate around an obstacle
+enum AvoidState {
+  AVOID_NONE = 0,  // No avoidance in progress
+  AVOID_TURN_1,    // First turn away from obstacle
+  AVOID_SHIFT_1,   // First lateral shift
+  AVOID_TURN_2,    // Second turn to align with obstacle
+  AVOID_PASS,      // Drive past the obstacle
+  AVOID_TURN_3,    // Third turn to re-align with original path
+  AVOID_SHIFT_2,   // Second lateral shift back
+  AVOID_TURN_4     // Fourth turn to restore original heading
+};
+AvoidState avoidState = AVOID_NONE;
+bool avoidTurnLeft = true;                 // Alternates left/right avoidance direction
+bool avoidDriveReverse = false;            // True if avoiding during reverse motion
+unsigned long avoidStateStartMs = 0;       // Timestamp for current avoidance state
+unsigned long avoidCooldownUntilMs = 0;    // Time until obstacle check resumes
+unsigned long lastObstacleCheckMs = 0;     // Timestamp of last obstacle check
+unsigned long avoidPauseStartMs = 0;       // Timestamp when avoidance began (for timer compensation)
+
+unsigned long currentActionDistanceCreditMs = 0; // Forward distance credited from avoidance pass
+
+bool phoneConnectedLogged = false; // Logs app connection once to Serial
+
+// HELPER FUNCTIONS
+
+// Normalises a heading angle to 0-359 degrees
+int normDeg(int d) {
+  while (d < 0) d += 360;
+  while (d >= 360) d -= 360;
+  return d;
+}
+
+// Returns true if the string contains only '0' and '1' characters
+bool isBinaryString(const String& s) {
+  if (s.length() == 0) return false;
+  for (int i = 0; i < s.length(); i++)
+    if (s[i] != '0' && s[i] != '1') return false;
+  return true;
+}
+
+// Extracts the URL path from an HTTP request line (e.g. "GET /go?to=1 HTTP/1.1")
+String getPathFromRequestLine(const String& reqLine) {
+  int s1 = reqLine.indexOf(' ');
+  int s2 = reqLine.indexOf(' ', s1 + 1);
+  if (s1 < 0 || s2 < 0) return "/";
+  return reqLine.substring(s1 + 1, s2);
+}
+
+// Extracts the value of a query parameter from a URL path
+// e.g. getParam("/go?to=2", "to") returns "2"
+String getParam(const String& path, const String& key) {
+  int q = path.indexOf('?');
+  if (q < 0) return "";
+  String qs = path.substring(q + 1);
+  String token = key + "=";
+  int start = qs.indexOf(token);
+  if (start < 0) return "";
+  start += token.length();
+  int end = qs.indexOf('&', start);
+  if (end < 0) end = qs.length();
+  return qs.substring(start, end);
+}
+
+// Returns HTTP status text for a given status code
+const char* statusText(int code) {
+  if (code == 200) return "OK";
+  if (code == 400) return "Bad Request";
+  if (code == 404) return "Not Found";
+  if (code == 409) return "Conflict";
+  return "OK";
+}
+
+// Sends a plain text HTTP response to the connected client
+void sendText(WiFiClient& c, int code, const String& body) {
+  c.print("HTTP/1.1 "); c.print(code); c.print(" "); c.println(statusText(code));
+  c.println("Content-Type: text/plain");
+  c.println("Access-Control-Allow-Origin: *"); // Allows cross-origin requests from app
+  c.println("Connection: close");
+  c.println();
+  c.println(body);
+}
+
+// Sends the full robot state as a JSON response to the connected client
+void sendStateJson(WiFiClient& c) {
+  c.println("HTTP/1.1 200 OK");
+  c.println("Content-Type: application/json");
+  c.println("Access-Control-Allow-Origin: *");
+  c.println("Connection: close");
+  c.println();
+
+  // JSON object containing all robot state fields
+  c.print("{\"moving\":"); c.print(carMoving ? "true" : "false");
+  c.print(",\"current\":"); c.print(currentPoint);
+  c.print(",\"currentPoint\":"); c.print(currentPoint);
+  c.print(",\"target\":"); c.print(targetPoint);
+  c.print(",\"progress\":"); c.print(progressPct);
+  c.print(",\"heading\":"); c.print(headingDeg);
+  c.print(",\"pinStatus\":\""); c.print(pinStatus); c.print("\"");
+  c.print(",\"ldr\":"); c.print(ldrRawValue);
+  c.print(",\"light\":\""); c.print(ambientLabel); c.print("\"");
+  c.print(",\"ambientLed\":\""); c.print(ambientLedsOn ? "ON" : "OFF"); c.print("\"");
+  c.println("}");
+}
+
+// WIFI FUNCTIONS
+
+// Waits for a valid DHCP IP address to be assigned, with a timeout
+bool waitForDhcpIP(unsigned long timeoutMs) {
+  unsigned long t0 = millis();
+  while (millis() - t0 < timeoutMs) {
+    if (WiFi.localIP()[0] != 0) return true; // IP assigned successfully
+    delay(250);
+  }
+  return false; // Timed out without receiving IP
+}
+
+// Attempts to connect to the WiFi hotspot, blocking until connected or timed out
+bool connectWiFiBlocking() {
+  int status = WL_IDLE_STATUS;
+  unsigned long t0 = millis();
+  while (status != WL_CONNECTED && (millis() - t0) < 30000) {
+    status = WiFi.begin(WIFI_SSID, WIFI_PASS);
+    delay(1200);
+  }
+  if (status != WL_CONNECTED) return false;
+  return waitForDhcpIP(12000); // Wait up to 12s for IP
+}
+
+// Starts the HTTP server if it has not already been started
+void startHttpServerIfNeeded() {
+  if (!serverStarted) { server.begin(); serverStarted = true; }
+}
+
+// Called every loop cycle to check WiFi status and reconnect if needed
+void ensureWiFiConnected() {
+  if (WiFi.status() == WL_CONNECTED && WiFi.localIP()[0] != 0) {
+    startHttpServerIfNeeded();
+    return;
+  }
+  unsigned long now = millis();
+  if (now - lastWifiRetryMs < WIFI_RETRY_MS) return; // Wait before retrying
+  lastWifiRetryMs = now;
+  WiFi.disconnect();
+  serverStarted = false;
+  if (connectWiFiBlocking()) startHttpServerIfNeeded();
+}
+
+// MOTOR CONTROL FUNCTIONS
+
+// Stops all motors by setting all motor pins LOW
+void motorsStop() {
+  digitalWrite(PIN_IN1, LOW); digitalWrite(PIN_IN2, LOW);
+  digitalWrite(PIN_IN3, LOW); digitalWrite(PIN_IN4, LOW);
+}
+
+// Drives all four motors forward
+void motorsForward() {
+  digitalWrite(PIN_IN1, HIGH); digitalWrite(PIN_IN2, LOW);
+  digitalWrite(PIN_IN3, HIGH); digitalWrite(PIN_IN4, LOW);
+}
+
+// Drives all four motors in reverse
+void motorsReverse() {
+  digitalWrite(PIN_IN1, LOW); digitalWrite(PIN_IN2, HIGH);
+  digitalWrite(PIN_IN3, LOW); digitalWrite(PIN_IN4, HIGH);
+}
+
+// Turns left: left motors reverse, right motors forward (differential steering)
+void motorsTurnLeft() {
+  digitalWrite(PIN_IN1, LOW); digitalWrite(PIN_IN2, HIGH);
+  digitalWrite(PIN_IN3, HIGH); digitalWrite(PIN_IN4, LOW);
+}
+
+// Turns right: right motors reverse, left motors forward (differential steering)
+void motorsTurnRight() {
+  digitalWrite(PIN_IN1, HIGH); digitalWrite(PIN_IN2, LOW);
+  digitalWrite(PIN_IN3, LOW); digitalWrite(PIN_IN4, HIGH);
+}
+
+// SENSOR FUNCTIONS
+
+// Reads distance in centimetres from an HC-SR04 ultrasonic sensor
+// Sends a 10us trigger pulse and measures the echo duration
+long readUltrasonicCm(int trigPin, int echoPin) {
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(2);
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10); // 10 microsecond trigger pulse
+  digitalWrite(trigPin, LOW);
+
+  unsigned long duration = pulseIn(echoPin, HIGH, 12000UL); // Timeout after 12ms
+  if (duration == 0) return 999; // No echo received = no obstacle detected
+  long cm = (long)(duration * 0.0343f / 2.0f); // Convert to cm (speed of sound = 343 m/s)
+  if (cm < 2) cm = 2; // Clamp minimum reading to 2cm
+  return cm;
+}
+
+// Writes to both ambient LEDs, respecting the LED_ACTIVE_LOW setting
+void writeAmbientLeds(bool on) {
+  bool pinHigh = LED_ACTIVE_LOW ? !on : on;
+  digitalWrite(AMBIENT_LED1_PIN, pinHigh ? HIGH : LOW);
+  digitalWrite(AMBIENT_LED2_PIN, pinHigh ? HIGH : LOW);
+}
+
+// Reads LDR sensor and automatically controls ambient LEDs based on light level
+void updateAmbientLeds() {
+  ldrRawValue = analogRead(LDR_PIN);
+
+  // Determine if environment is dark based on threshold and polarity setting
+  bool dark = DARK_WHEN_LDR_LOW ? (ldrRawValue < DARK_THRESHOLD)
+                                : (ldrRawValue > DARK_THRESHOLD);
+
+  ambientLedsOn = dark;
+  ambientLabel = dark ? "DARK" : "LIGHT";
+  writeAmbientLeds(ambientLedsOn); // Update LED output
+}
+
+// MOTION PLANNER FUNCTIONS
+
+// Returns the required heading (degrees) to reach a given delivery point
+int pointToHeadingDeg(int p) {
+  if (p == 1) return 315;
+  if (p == 2) return 45;
+  if (p == 3) return 315;
+  if (p == 4) return 45;
+  return HOME_HEADING_DEG;
+}
+
+// Returns the movement type (forward or reverse) required to reach a delivery point
+uint8_t pointToMoveType(int p) {
+  if (p == 1 || p == 2) return ACT_FORWARD;
+  if (p == 3 || p == 4) return ACT_REVERSE;
+  return ACT_NONE;
+}
+
+// Returns true if an action type should count toward delivery progress
+bool isProgressAction(uint8_t t) {
+  return (t == ACT_FORWARD || t == ACT_REVERSE ||
+          t == ACT_TURN_LEFT_45 || t == ACT_TURN_RIGHT_45 ||
+          t == ACT_TURN_RIGHT_TRIM || t == ACT_TURN_LEFT_TRIM);
+}
+
+// Clears the current motion plan and resets all related state variables
+void clearPlan() {
+  planCount = 0; planIndex = 0; actionRunning = false;
+  totalProgressActions = 0; doneProgressActions = 0; progressPct = 0;
+  avoidState = AVOID_NONE;
+  currentActionDistanceCreditMs = 0;
+}
+
+// Adds a single action step to the motion plan
+bool addPlan(uint8_t t, unsigned long d) {
+  if (planCount >= MAX_PLAN) return false; // Plan is full
+  planType[planCount] = t;
+  planDur[planCount] = d;
+  planCount++;
+  if (isProgressAction(t)) totalProgressActions++;
+  return true;
+}
+
+// Adds the minimum number of 45-degree turns needed to reach a target heading
+void addTurnsToHeading(int targetDeg) {
+  targetDeg = normDeg(targetDeg);
+  headingDeg = normDeg(headingDeg);
+
+  int cw  = (targetDeg - headingDeg + 360) % 360; // Clockwise angle
+  int ccw = (headingDeg - targetDeg + 360) % 360; // Counter-clockwise angle
+  int cwSteps  = cw  / 45;
+  int ccwSteps = ccw / 45;
+
+  // Choose the shorter rotation direction
+  if (ccwSteps < cwSteps) {
+    for (int i = 0; i < ccwSteps; i++) {
+      addPlan(ACT_TURN_LEFT_45, TURN_45_MS);
+      headingDeg = normDeg(headingDeg - 45);
+    }
+  } else {
+    for (int i = 0; i < cwSteps; i++) {
+      addPlan(ACT_TURN_RIGHT_45, TURN_45_MS);
+      headingDeg = normDeg(headingDeg + 45);
+    }
+  }
+}
+
+// Builds a complete movement plan to navigate to a delivery point (1-4)
+void buildTripToPoint(int p) {
+  if (p < 1 || p > 4) return;
+  clearPlan();
+  targetPoint = p;
+
+  // If currently at a delivery point, return to centre first
+  if (currentPoint != 0) {
+    uint8_t oldMove = pointToMoveType(currentPoint);
+    uint8_t returnMove = (oldMove == ACT_FORWARD) ? ACT_REVERSE : ACT_FORWARD;
+    addPlan(returnMove, DRIVE_DIAG_MS);
+    addPlan(ACT_WAIT, CENTER_PAUSE_MS);
+    if (currentPoint == 2 || currentPoint == 4)
+      addPlan(ACT_TURN_LEFT_TRIM, TURN_TRIM_LEFT_MS); // Correct diagonal drift
+    addTurnsToHeading(HOME_HEADING_DEG);
+    addPlan(ACT_WAIT, 80);
+  } else {
+    addTurnsToHeading(HOME_HEADING_DEG);
+  }
+
+  // Turn to face target and drive to destination
+  addTurnsToHeading(pointToHeadingDeg(p));
+  if (p == 2 || p == 4)
+    addPlan(ACT_TURN_RIGHT_TRIM, TURN_TRIM_RIGHT_MS); // Correct diagonal drift
+  addPlan(pointToMoveType(p), DRIVE_DIAG_MS);
+
+  carMoving = (planCount > 0);
+  if (!carMoving) progressPct = 100;
+}
+
+// Builds a movement plan to return the robot to the home/parking position
+void buildTripToParking() {
+  clearPlan();
+  targetPoint = 0;
+
+  if (currentPoint == 0) {
+    carMoving = false;
+    progressPct = 100;
+    return; // Already at home
+  }
+
+  // Reverse out of current delivery point and return to home heading
+  uint8_t oldMove = pointToMoveType(currentPoint);
+  uint8_t returnMove = (oldMove == ACT_FORWARD) ? ACT_REVERSE : ACT_FORWARD;
+  addPlan(returnMove, DRIVE_DIAG_MS);
+  addPlan(ACT_WAIT, CENTER_PAUSE_MS);
+  if (currentPoint == 2 || currentPoint == 4)
+    addPlan(ACT_TURN_LEFT_TRIM, TURN_TRIM_LEFT_MS);
+  addTurnsToHeading(HOME_HEADING_DEG);
+  addPlan(ACT_WAIT, 80);
+
+  carMoving = (planCount > 0);
+  if (!carMoving) progressPct = 100;
+}
+
+// Starts executing the current plan step by activating the appropriate motor function
+void startCurrentAction(uint8_t t) {
+  if (t == ACT_FORWARD) motorsForward();
+  else if (t == ACT_REVERSE) motorsReverse();
+  else if (t == ACT_TURN_LEFT_45 || t == ACT_TURN_LEFT_TRIM) motorsTurnLeft();
+  else if (t == ACT_TURN_RIGHT_45 || t == ACT_TURN_RIGHT_TRIM) motorsTurnRight();
+  else motorsStop(); // ACT_WAIT or ACT_NONE
+
+  actionStartMs = millis();
+  actionRunning = true;
+  currentActionDistanceCreditMs = 0;
+}
+
+// Called when a plan step is complete — stops motors and updates progress
+void finishCurrentAction(uint8_t t) {
+  motorsStop();
+  actionRunning = false;
+  if (isProgressAction(t)) {
+    doneProgressActions++;
+    if (totalProgressActions > 0)
+      progressPct = (doneProgressActions * 100) / totalProgressActions;
+  }
+}
+
+// Returns true if obstacle detection is relevant for the given action type
+bool shouldCheckObstacleForAction(uint8_t t) {
+  return (t == ACT_FORWARD || t == ACT_REVERSE);
+}
+
+// Checks the appropriate ultrasonic sensor based on direction of travel
+bool obstacleDetectedForAction(uint8_t t) {
+  long cm = 999;
+  if (t == ACT_FORWARD) cm = readUltrasonicCm(US_FRONT_TRIG, US_FRONT_ECHO);
+  else if (t == ACT_REVERSE) cm = readUltrasonicCm(US_BACK_TRIG, US_BACK_ECHO);
+  return (cm <= OBSTACLE_CM_THRESHOLD);
+}
+
+// Drives forward or reverse depending on the direction of the interrupted action
+void avoidDriveStep() {
+  if (avoidDriveReverse) motorsReverse();
+  else motorsForward();
+}
+
+// Initiates the obstacle avoidance sequence
+// Alternates left/right avoidance direction on each event
+void startAvoidance(uint8_t actionType) {
+  avoidDriveReverse = (actionType == ACT_REVERSE);
+  avoidTurnLeft = !avoidTurnLeft; // Alternate direction each time
+  avoidState = AVOID_TURN_1;
+  avoidStateStartMs = millis();
+  avoidPauseStartMs = avoidStateStartMs;
+}
+
+// Executes the current step of the 8-state obstacle avoidance sequence
+void updateAvoidance() {
+  unsigned long now = millis();
+
+  if (avoidState == AVOID_TURN_1) {
+    // Turn sideways away from the obstacle
+    if (avoidTurnLeft) motorsTurnLeft(); else motorsTurnRight();
+    if (now - avoidStateStartMs >= AVOID_TURN_MS) {
+      avoidState = AVOID_SHIFT_1;
+      avoidStateStartMs = now;
+    }
+    return;
+  }
+  if (avoidState == AVOID_SHIFT_1) {
+    // Drive laterally past the obstacle
+    avoidDriveStep();
+    if (now - avoidStateStartMs >= AVOID_SHIFT_MS) {
+      avoidState = AVOID_TURN_2;
+      avoidStateStartMs = now;
+    }
+    return;
+  }
+  if (avoidState == AVOID_TURN_2) {
+    // Turn back to original direction
+    if (avoidTurnLeft) motorsTurnRight(); else motorsTurnLeft();
+    if (now - avoidStateStartMs >= AVOID_TURN_MS) {
+      avoidState = AVOID_PASS;
+      avoidStateStartMs = now;
+    }
+    return;
+  }
+  if (avoidState == AVOID_PASS) {
+    // Drive forward past the obstacle
+    avoidDriveStep();
+    if (now - avoidStateStartMs >= AVOID_PASS_MS) {
+      avoidState = AVOID_TURN_3;
+      avoidStateStartMs = now;
+    }
+    return;
+  }
+  if (avoidState == AVOID_TURN_3) {
+    // Turn sideways to re-align with original path
+    if (avoidTurnLeft) motorsTurnRight(); else motorsTurnLeft();
+    if (now - avoidStateStartMs >= AVOID_TURN_MS) {
+      avoidState = AVOID_SHIFT_2;
+      avoidStateStartMs = now;
+    }
+    return;
+  }
+  if (avoidState == AVOID_SHIFT_2) {
+    // Drive back to original lateral position
+    avoidDriveStep();
+    if (now - avoidStateStartMs >= AVOID_SHIFT_MS) {
+      avoidState = AVOID_TURN_4;
+      avoidStateStartMs = now;
+    }
+    return;
+  }
+  if (avoidState == AVOID_TURN_4) {
+    // Final turn to restore original heading
+    if (avoidTurnLeft) motorsTurnLeft(); else motorsTurnRight();
+    if (now - avoidStateStartMs >= AVOID_TURN_MS) {
+      avoidState = AVOID_NONE;
+      avoidCooldownUntilMs = now + AVOID_COOLDOWN_MS;
+      motorsStop();
+
+      // Compensate the original action timer for time spent avoiding
+      if (actionRunning) actionStartMs += (now - avoidPauseStartMs);
+
+      // Credit the forward distance covered during the PASS phase
+      currentActionDistanceCreditMs += AVOID_PASS_DISTANCE_CREDIT_MS;
+    }
+  }
+}
+
+// Main motion execution loop — called every cycle to advance the movement plan
+void updateMotion() {
+  if (!carMoving) return;
+
+  // Check if all plan steps have been completed
+  if (planIndex >= planCount) {
+    carMoving = false;
+    progressPct = 100;
+    motorsStop();
+    currentPoint = targetPoint; // Update current position
+    return;
+  }
+
+  uint8_t t = planType[planIndex];
+  unsigned long d = planDur[planIndex];
+
+  // Start the action if not already running
+  if (!actionRunning) startCurrentAction(t);
+
+  // If avoidance is active, delegate control to avoidance handler
+  if (avoidState != AVOID_NONE) {
+    updateAvoidance();
+    return;
+  }
+
+  // Periodically check for obstacles during forward/reverse actions
+  unsigned long now = millis();
+  if (actionRunning && shouldCheckObstacleForAction(t) &&
+      now > avoidCooldownUntilMs &&
+      now - lastObstacleCheckMs >= OBSTACLE_CHECK_MS) {
+    lastObstacleCheckMs = now;
+    if (obstacleDetectedForAction(t)) {
+      startAvoidance(t);
+      updateAvoidance();
+      return;
+    }
+  }
+
+  // Calculate remaining duration, accounting for distance already covered during avoidance
+  unsigned long requiredMs = d;
+  if (currentActionDistanceCreditMs < requiredMs)
+    requiredMs -= currentActionDistanceCreditMs;
+  else
+    requiredMs = 0;
+
+  // Advance to next plan step when duration has elapsed
+  if (actionRunning && (now - actionStartMs >= requiredMs)) {
+    finishCurrentAction(t);
+    planIndex++;
+  }
+}
+
+// LOCK / DOOR FUNCTIONS
+
+// Sets servo motor angles and door LED based on locked/unlocked state
+// Note: servo direction is reversed using (180 - angle) for correct physical movement
+void setDoorUnlockedOutputs(bool unlocked) {
+  auto writeOpp = [](Servo& s, int angle) {
+    s.write(180 - angle); // Reverse servo direction
+  };
+
+  if (unlocked) {
+    writeOpp(servo1, SERVO1_UNLOCK_ANGLE);
+    writeOpp(servo2, SERVO2_UNLOCK_ANGLE);
+    digitalWrite(DOOR_LED_PIN, HIGH); // Turn on white LED to indicate door is open
+  } else {
+    writeOpp(servo1, SERVO1_LOCK_ANGLE);
+    writeOpp(servo2, SERVO2_LOCK_ANGLE);
+    digitalWrite(DOOR_LED_PIN, LOW);  // Turn off white LED
+  }
+}
+
+// Resets the door to locked state and clears all flow state
+void resetToLockedState() {
+  setDoorUnlockedOutputs(false);
+  digitalWrite(BUZZER_PIN, LOW);
+  flowState = FLOW_IDLE;
+}
+
+// Initiates the success flow after correct PIN entry
+void startSuccessFlow() {
+  pinStatus = "OK_OPENING";
+  flowState = FLOW_ALERT;
+  flowTimer = millis();
+  blinkCount = 0;
+  blinkOn = false;
+}
+
+// Returns true if a parcel is detected on the pressure sensor
+bool isParcelPresent() {
+  int v = analogRead(PRESSURE_SENSOR_PIN);
+  return (v < PRESSURE_THRESHOLD); // Low ADC value = pressure applied = parcel present
+}
+
+// Manages the door open/close flow state machine
+// Sequence: buzzer blinks → door opens → wait for parcel → 5s delay → door closes
+void updateFlow() {
+  unsigned long now = millis();
+
+  if (flowState == FLOW_ALERT) {
+    // Blink buzzer at BLINK_MS intervals
+    if (now - flowTimer >= BLINK_MS) {
+      flowTimer = now;
+      blinkOn = !blinkOn;
+      digitalWrite(BUZZER_PIN, blinkOn ? HIGH : LOW);
+      blinkCount++;
+      if (blinkCount >= BLINK_TOGGLES) {
+        // All blinks complete — open door
+        digitalWrite(BUZZER_PIN, LOW);
+        setDoorUnlockedOutputs(true);
+        pinStatus = (parcelMode == PARCEL_MODE_LOAD) ? "PLACE_PARCEL" : "TAKE_PARCEL";
+        flowState = FLOW_OPEN_WAIT_SENSOR;
+      }
+    }
+    return;
+  }
+
+  if (flowState == FLOW_OPEN_WAIT_SENSOR) {
+    // Wait for parcel to be placed (load mode) or removed (unload mode)
+    bool present = isParcelPresent();
+    if (parcelMode == PARCEL_MODE_LOAD && present) {
+      pinStatus = "PARCEL_DETECTED_WAIT_5S";
+      flowState = FLOW_PARCEL_DELAY;
+      flowTimer = now;
+    } else if (parcelMode == PARCEL_MODE_UNLOAD && !present) {
+      pinStatus = "PARCEL_REMOVED_WAIT_5S";
+      flowState = FLOW_PARCEL_DELAY;
+      flowTimer = now;
+    }
+    return;
+  }
+
+  if (flowState == FLOW_PARCEL_DELAY) {
+    // Close the door after 5-second delay
+    if (now - flowTimer >= CLOSE_DELAY_MS) {
+      setDoorUnlockedOutputs(false);
+      pinStatus = "CLOSED";
+      flowState = FLOW_DONE;
+    }
+  }
+}
+
+// Checks if the entered PIN pattern is complete and evaluates it
+void evaluatePatternIfComplete() {
+  if (inputPattern.length() != correctPattern.length()) return;
+  if (inputPattern == correctPattern)
+    startSuccessFlow(); // Correct PIN — trigger door open sequence
+  else
+    pinStatus = "FAIL";  // Incorrect PIN
+  inputPattern = ""; // Reset input for next attempt
+}
+
+// Appends a binary digit to the current PIN input
+void appendBit(char bit) {
+  if (pinStatus == "FAIL") pinStatus = "WAIT"; // Reset fail state on new input
+  inputPattern += bit;
+  typedFeed += bit;
+  // Keep only the last 24 digits in the feed display
+  if (typedFeed.length() > 24)
+    typedFeed.remove(0, typedFeed.length() - 24);
+  if (MOCK_OUTPUT_PIN >= 0)
+    digitalWrite(MOCK_OUTPUT_PIN, (bit == '1') ? HIGH : LOW);
+  evaluatePatternIfComplete();
+}
+
+// Reads Switch 1 (binary '1') with debounce and appends '1' on press
+void readSwitchOne() {
+  int reading = digitalRead(SWITCH_ONE_PIN);
+  if (reading != lastOneReading) {
+    lastOneDebounce = millis();
+    lastOneReading = reading;
+  }
+  if ((millis() - lastOneDebounce) > DEBOUNCE_MS) {
+    static int stableOne = HIGH;
+    if (reading != stableOne) {
+      stableOne = reading;
+      if (stableOne == LOW) appendBit('1'); // Register press on falling edge
+    }
+  }
+}
+
+// Reads Switch 0 (binary '0') with debounce and appends '0' on press
+void readSwitchZero() {
+  int reading = digitalRead(SWITCH_ZERO_PIN);
+  if (reading != lastZeroReading) {
+    lastZeroDebounce = millis();
+    lastZeroReading = reading;
+  }
+  if ((millis() - lastZeroDebounce) > DEBOUNCE_MS) {
+    static int stableZero = HIGH;
+    if (reading != stableZero) {
+      stableZero = reading;
+      if (stableZero == LOW) appendBit('0'); // Register press on falling edge
+    }
+  }
+}
+
+// Immediately stops all movement and clears the motion plan
+void hardStopEverything() {
+  carMoving = false;
+  clearPlan();
+  motorsStop();
+  avoidState = AVOID_NONE;
+  actionRunning = false;
+}
+
+// HTTP REQUEST HANDLER
+
+// Handles incoming HTTP requests from the mobile application
+// Routes each path to the appropriate action and sends a response
+void handleHttp() {
+  WiFiClient client = server.available();
+  if (!client) return;
+
+  client.setTimeout(120);
+  String reqLine = client.readStringUntil('\r');
+  client.readStringUntil('\n'); // Discard remainder of request line
+  String path = getPathFromRequestLine(reqLine);
+
+  if (path == "/ping") {
+    // Connection test — app sends ping, robot responds with pong
+    if (!phoneConnectedLogged) { phoneConnectedLogged = true; Serial.println("phone connected"); }
+    sendText(client, 200, "pong");
+
+  } else if (path == "/state") {
+    // Returns full JSON state including movement, position, PIN, and light status
+    sendStateJson(client);
+
+  } else if (path == "/light-status") {
+    // Returns current ambient LED state (ON or OFF)
+    sendText(client, 200, ambientLedsOn ? "ON" : "OFF");
+
+  } else if (path == "/light") {
+    // Returns current light condition (LIGHT or DARK)
+    sendText(client, 200, ambientLabel);
+
+  } else if (path == "/ldr") {
+    // Returns raw LDR analog reading
+    sendText(client, 200, String(ldrRawValue));
+
+  } else if (path == "/go-parking") {
+    // Commands robot to return to home/parking position
+    if (carMoving) sendText(client, 409, "busy");
+    else { buildTripToParking(); sendText(client, 200, "started:parking"); }
+
+  } else if (path.startsWith("/go")) {
+    // Commands robot to navigate to a delivery point (?to=1 to ?to=4)
+    int to = getParam(path, "to").toInt();
+    if (to < 1 || to > 4) sendText(client, 400, "invalid target");
+    else if (carMoving) sendText(client, 409, "busy");
+    else { buildTripToPoint(to); sendText(client, 200, "started:" + String(to)); }
+
+  } else if (path == "/set-parking") {
+    // Manually sets robot position to home without movement
+    hardStopEverything();
+    currentPoint = 0; targetPoint = 0;
+    headingDeg = HOME_HEADING_DEG; progressPct = 100;
+    sendText(client, 200, "ok parking set");
+
+  } else if (path == "/stop") {
+    // Emergency stop — immediately halts all movement
+    hardStopEverything();
+    sendText(client, 200, "stopped");
+
+  } else if (path.startsWith("/set-pin")) {
+    // Sets a new PIN code and parcel mode (load or unload)
+    String code = getParam(path, "code");
+    String mode = getParam(path, "mode");
+    if (!isBinaryString(code) || code.length() < 4 || code.length() > 8) {
+      sendText(client, 400, "invalid code");
+    } else {
+      parcelMode = (mode == "unload") ? PARCEL_MODE_UNLOAD : PARCEL_MODE_LOAD;
+      correctPattern = code;
+      inputPattern = "";
+      typedFeed = "";
+      pinStatus = "WAIT";
+      resetToLockedState();
+      sendText(client, 200, "ok");
+    }
+
+  } else if (path == "/pin-status") {
+    // Returns current PIN/door status string
+    sendText(client, 200, pinStatus);
+
+  } else if (path == "/pin-feed") {
+    // Returns the last 24 digits typed into the PIN input
+    sendText(client, 200, typedFeed);
+
+  } else if (path == "/clear-feed") {
+    // Clears the typed PIN feed
+    typedFeed = "";
+    sendText(client, 200, "ok");
+
+  } else {
+    sendText(client, 404, "not found");
+  }
+
+  client.stop(); // Close connection after response
+}
+
+// SETUP
+
+void setup() {
+  Serial.begin(9600);
+  delay(800); // Allow Serial to initialise
+
+  // Initialise motor driver pins as outputs and stop motors
+  pinMode(PIN_IN1, OUTPUT); pinMode(PIN_IN2, OUTPUT);
+  pinMode(PIN_IN3, OUTPUT); pinMode(PIN_IN4, OUTPUT);
+  motorsStop();
+
+  // Configure switch pins with internal pull-up resistors
+  pinMode(SWITCH_ONE_PIN, INPUT_PULLUP);
+  pinMode(SWITCH_ZERO_PIN, INPUT_PULLUP);
+  if (MOCK_OUTPUT_PIN >= 0) pinMode(MOCK_OUTPUT_PIN, OUTPUT);
+
+  // Initialise output pins
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(LDR_PIN, INPUT);
+  pinMode(AMBIENT_LED1_PIN, OUTPUT);
+  pinMode(AMBIENT_LED2_PIN, OUTPUT);
+  pinMode(DOOR_LED_PIN, OUTPUT);
+
+  // Initialise ultrasonic sensor pins
+  pinMode(US_FRONT_TRIG, OUTPUT); pinMode(US_FRONT_ECHO, INPUT);
+  pinMode(US_BACK_TRIG, OUTPUT);  pinMode(US_BACK_ECHO, INPUT);
+
+  // Set all outputs to their initial OFF state
+  if (MOCK_OUTPUT_PIN >= 0) digitalWrite(MOCK_OUTPUT_PIN, LOW);
+  digitalWrite(BUZZER_PIN, LOW);
+  writeAmbientLeds(false);
+  digitalWrite(DOOR_LED_PIN, LOW);
+
+  // Attach servo motors and lock the door
+  servo1.attach(SERVO1_PIN);
+  servo2.attach(SERVO2_PIN);
+  resetToLockedState();
+
+  // Attempt initial WiFi connection
+  if (connectWiFiBlocking()) startHttpServerIfNeeded();
+}
+
+// MAIN LOOP
+
+void loop() {
+  ensureWiFiConnected(); // Reconnect WiFi if disconnected
+
+  // Handle incoming HTTP requests if WiFi and server are active
+  if (WiFi.status() == WL_CONNECTED && WiFi.localIP()[0] != 0 && serverStarted) {
+    handleHttp();
+  }
+
+  // Update all subsystems on every loop cycle
+  updateAmbientLeds(); // Check LDR and control ambient LEDs
+  readSwitchOne();     // Check Switch 1 for PIN input
+  readSwitchZero();    // Check Switch 0 for PIN input
+  updateFlow();        // Manage door open/close sequence
+  updateMotion();      // Execute current motion plan step
+}
